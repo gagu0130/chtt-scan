@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="mn">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ЧТТ — чингэлэг сканнер</title>
+<style>
+  :root { --g:#16A34A; --y:#F59E0B; --bg:#0B1220; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:#F8FAFC; font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; overflow:hidden; }
+  #wrap { position:fixed; inset:0; }
+  video { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+  #ov { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+  .top { position:absolute; top:0; left:0; right:0; padding:12px 14px calc(12px + env(safe-area-inset-top)); display:flex; gap:10px; align-items:center; background:linear-gradient(#000a, #0000); }
+  .top b { font-size:17px; flex:1; }
+  .btn { border:0; border-radius:12px; padding:12px 16px; font:700 16px system-ui,sans-serif; cursor:pointer; }
+  .ghost { background:#ffffff22; color:#fff; }
+  #msg { position:absolute; left:0; right:0; text-align:center; font-weight:600; text-shadow:0 1px 4px #000; }
+  .bottom { position:absolute; left:0; right:0; bottom:0; padding:12px 14px calc(14px + env(safe-area-inset-bottom)); background:linear-gradient(#0000, #000c 30%); }
+  #found { display:none; background:#fff; color:#111; border-radius:16px; padding:14px; margin-bottom:12px; box-shadow:0 8px 30px #0008; }
+  #found .code { font:800 30px ui-monospace,Menlo,Consolas,monospace; letter-spacing:.04em; text-align:center; }
+  #found .code span { color:var(--g); }
+  #found .q { text-align:center; color:#374151; margin:4px 0 12px; }
+  #found .row { display:flex; gap:10px; } #found .row .btn { flex:1; font-size:19px; padding:16px; }
+  .ok { background:var(--g); color:#fff; } .no { background:#E5E7EB; color:#111; }
+  #list { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; }
+  .chip { background:#ffffff1f; border:1px solid #ffffff44; border-radius:10px; padding:6px 10px; font:700 15px ui-monospace,Menlo,Consolas,monospace; display:flex; gap:8px; align-items:center; }
+  .chip button { background:none; border:0; color:#fca5a5; font-size:16px; cursor:pointer; }
+  #done { width:100%; font-size:19px; padding:16px; background:var(--y); color:#111; }
+  #done:disabled { background:#475569; color:#cbd5e1; }
+  #manual { width:100%; margin-top:8px; }
+  #err { position:absolute; inset:0; display:none; align-items:center; justify-content:center; padding:24px; text-align:center; background:var(--bg); }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="v" playsinline muted autoplay></video>
+  <canvas id="ov"></canvas>
+  <div class="top"><b>Чингэлгийн дугаар уншуулах <span id="cnt"></span></b><button class="btn ghost" id="torch" hidden>🔦</button><button class="btn ghost" id="close">✕</button></div>
+  <div id="msg">Камер асааж байна…</div>
+  <div class="bottom">
+    <div id="found"><div class="code" id="fcode"></div><div class="q">Энэ дугаар зөв үү?</div>
+      <div class="row"><button class="btn no" id="fno">✗ Үгүй</button><button class="btn ok" id="fok">✓ Зөв</button></div></div>
+    <div id="list"></div>
+    <button class="btn" id="done" disabled>Вэб рүү илгээх</button>
+    <button class="btn ghost" id="manual">Дугаараа гараар бичих</button>
+  </div>
+  <div id="err"></div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var qs = new URLSearchParams(location.search), MAX = Math.max(1, Math.min(4, +(qs.get('n') || 4)));
+  var LOCAL = qs.get('local') === '1';
+  var v = $('v'), ov = $('ov'), ctx = ov.getContext('2d'), work = document.createElement('canvas');
+  var picked = [], rejected = {}, pending = null, busy = false, worker = null, stream = null;
+
+  /* ISO 6346 шалгах орон */
+  function isoOk(c) {
+    if (!/^[A-Z]{4}\d{7}$/.test(c)) return false;
+    var val = function (ch) { var n = ch.charCodeAt(0) - 55; return n + Math.floor((n - 1) / 10); }, s = 0;
+    for (var i = 0; i < 10; i++) s += (i < 4 ? val(c[i]) : +c[i]) * Math.pow(2, i);
+    return (s % 11) % 10 === +c[10];
+  }
+  var toD = { O: '0', Q: '0', D: '0', I: '1', L: '1', T: '1', Z: '2', S: '5', B: '8', G: '6' };
+  var toL = { '0': 'O', '1': 'I', '2': 'Z', '5': 'S', '8': 'B', '6': 'G' };
+  /** OCR текстээс ISO-оор зөв чингэлгийн дугаарууд */
+  function findCodes(text) {
+    var T = String(text).toUpperCase(), out = [];
+    var lines = T.split(/\n/).map(function (l) { return l.replace(/[^A-Z0-9]/g, ''); });
+    lines.push(T.replace(/[^A-Z0-9]/g, ''));
+    lines.forEach(function (l) {
+      for (var i = 0; i + 11 <= l.length; i++) {
+        var s = l.substr(i, 11), a = s.slice(0, 4).split('').map(function (c) { return toL[c] || c; }).join(''), d = s.slice(4).split('').map(function (c) { return toD[c] || c; }).join('');
+        if (!/^[A-Z]{3}[UJZ]$/.test(a) || !/^\d{7}$/.test(d)) continue;
+        var c = a + d; if (isoOk(c) && out.indexOf(c) < 0) out.push(c);
+      }
+    });
+    return out;
+  }
+  function guide() { var W = ov.width, H = ov.height, gw = Math.round(W * 0.86), gh = Math.round(Math.min(H * 0.2, gw * 0.3)); return { x: (W - gw) / 2, y: H * 0.34 - gh / 2, w: gw, h: gh }; }
+  function draw(color, label) {
+    ov.width = ov.clientWidth * devicePixelRatio; ov.height = ov.clientHeight * devicePixelRatio;
+    var g = guide(); ctx.clearRect(0, 0, ov.width, ov.height);
+    ctx.fillStyle = '#0007'; ctx.fillRect(0, 0, ov.width, g.y); ctx.fillRect(0, g.y + g.h, ov.width, ov.height); ctx.fillRect(0, g.y, g.x, g.h); ctx.fillRect(g.x + g.w, g.y, ov.width, g.h);
+    ctx.lineWidth = 5 * devicePixelRatio; ctx.strokeStyle = color; ctx.strokeRect(g.x, g.y, g.w, g.h);
+    $('msg').style.top = (g.y + g.h) / devicePixelRatio + 12 + 'px'; $('msg').textContent = label;
+  }
+  function crop() {
+    // видеоны харагдаж буй хэсгээс хүрээний доторхыг тайрна
+    var vw = v.videoWidth, vh = v.videoHeight, cw = ov.clientWidth, ch = ov.clientHeight;
+    var sc = Math.max(cw / vw, ch / vh), ox = (cw - vw * sc) / 2, oy = (ch - vh * sc) / 2, g = guide(), d = devicePixelRatio;
+    var sx = (g.x / d - ox) / sc, sy = (g.y / d - oy) / sc, sw = g.w / d / sc, sh = g.h / d / sc;
+    var k = Math.min(2.5, 1400 / sw); work.width = Math.round(sw * k); work.height = Math.round(sh * k);
+    var c = work.getContext('2d'); c.filter = 'grayscale(1) contrast(1.6)'; c.drawImage(v, sx, sy, sw, sh, 0, 0, work.width, work.height);
+    return work;
+  }
+  function loop() {
+    if (!busy && !pending && worker && v.readyState >= 2 && picked.length < MAX) {
+      busy = true;
+      worker.recognize(crop()).then(function (r) {
+        busy = false;
+        var codes = findCodes(r.data.text).filter(function (c) { return picked.indexOf(c) < 0 && !rejected[c]; });
+        if (codes.length) { pending = codes[0]; showFound(); }
+      }).catch(function () { busy = false; });
+    }
+    if (!pending) draw(picked.length >= MAX ? '#94A3B8' : '#ffffffcc', picked.length >= MAX ? MAX + ' чингэлэг уншигдлаа — «Вэб рүү илгээх» дарна уу' : 'Чингэлгийн дугаарыг цагаан хүрээнд багтаана уу');
+    setTimeout(loop, 350);
+  }
+  function showFound() {
+    draw('#16A34A', '✓ Дугаар олдлоо');
+    if (navigator.vibrate) navigator.vibrate(80);
+    $('fcode').innerHTML = pending.slice(0, 4) + '<span>' + pending.slice(4) + '</span>'; $('found').style.display = 'block';
+  }
+  function render() {
+    $('cnt').textContent = picked.length + '/' + MAX;
+    $('list').innerHTML = picked.map(function (c, i) { return '<span class="chip">' + c + '<button data-i="' + i + '">✕</button></span>'; }).join('');
+    $('list').querySelectorAll('button').forEach(function (b) { b.onclick = function () { picked.splice(+b.dataset.i, 1); render(); }; });
+    $('done').disabled = !picked.length; $('done').textContent = picked.length ? 'Вэб рүү илгээх (' + picked.length + ')' : 'Вэб рүү илгээх';
+  }
+  $('fok').onclick = function () { picked.push(pending); pending = null; $('found').style.display = 'none'; render(); };
+  $('fno').onclick = function () { rejected[pending] = 1; setTimeout(function (c) { delete rejected[c]; }, 4000, pending); pending = null; $('found').style.display = 'none'; };
+  $('manual').onclick = function () {
+    var c = (prompt('Чингэлгийн дугаар (жиш. CICU3534290)') || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    if (!c) return; if (!isoOk(c) && !confirm(c + ' — шалгах орон таарахгүй байна. Тэгсэн ч нэмэх үү?')) return;
+    if (picked.indexOf(c) < 0 && picked.length < MAX) picked.push(c); render();
+  };
+  function send() {
+    var data = { type: 'tt-scan', codes: picked.slice() };
+    try { if (window.opener) { window.opener.postMessage(data, '*'); stop(); window.close(); return; } } catch (e) { }
+    // нээсэн цонх олдохгүй бол: хуулах
+    var txt = picked.join(' ');
+    (navigator.clipboard ? navigator.clipboard.writeText(txt) : Promise.reject()).then(function () { alert('Дугаарууд хуулагдлаа: ' + txt + '\nВэб дээрх чингэлгийн нүдэнд буулгана уу.'); }, function () { prompt('Эдгээрийг хуулна уу:', txt); });
+  }
+  $('done').onclick = send;
+  $('close').onclick = function () { stop(); window.close(); };
+  function stop() { try { stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) { } }
+
+  // камер + OCR
+  function fail(t) { $('err').style.display = 'flex'; $('err').innerHTML = '<div><h2>Камер нээгдсэнгүй</h2><p>' + t + '</p><p>Хөтчийн тохиргоонд энэ сайтад камерын эрх (Allow) олгоно уу.</p></div>'; }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) fail('Энэ хөтөч камер дэмжихгүй байна.');
+  else navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false }).then(function (s) {
+    stream = s; v.srcObject = s; v.play();
+    var tr = s.getVideoTracks()[0], caps = tr.getCapabilities ? tr.getCapabilities() : {};
+    if (caps.torch) { $('torch').hidden = false; var on = false; $('torch').onclick = function () { on = !on; tr.applyConstraints({ advanced: [{ torch: on }] }); }; }
+    if (caps.focusMode && caps.focusMode.indexOf('continuous') >= 0) tr.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }).catch(function () { });
+    draw('#ffffffcc', 'Унших програм ачаалж байна… (анх удаа 5–10 сек)');
+    var opt = LOCAL ? { workerPath: './node_modules/tesseract.js/dist/worker.min.js', corePath: './node_modules/tesseract.js-core', langPath: './node_modules/@tesseract.js-data/eng/4.0.0_best_int' } : {};
+    return Tesseract.createWorker('eng', 1, opt).then(function (w) {
+      worker = w;
+      return w.setParameters({ tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', tessedit_pageseg_mode: '6' });
+    }).then(function () { render(); loop(); });
+  }).catch(function (e) { fail(e && e.message || String(e)); });
+  render();
+})();
+</script>
+</body>
+</html>
