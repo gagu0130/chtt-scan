@@ -29,6 +29,7 @@
   #done { width:100%; font-size:19px; padding:16px; background:var(--y); color:#111; }
   #done:disabled { background:#475569; color:#cbd5e1; }
   #manual { width:100%; margin-top:8px; }
+  #found .note { text-align:center; font-size:13px; color:#B45309; margin-top:-6px; margin-bottom:10px; }
   #err { position:absolute; inset:0; display:none; align-items:center; justify-content:center; padding:24px; text-align:center; background:var(--bg); }
 </style>
 </head>
@@ -39,7 +40,7 @@
   <div class="top"><b>Чингэлгийн дугаар уншуулах <span id="cnt"></span></b><button class="btn ghost" id="torch" hidden>🔦</button><button class="btn ghost" id="close">✕</button></div>
   <div id="msg">Камер асааж байна…</div>
   <div class="bottom">
-    <div id="found"><div class="code" id="fcode"></div><div class="q">Энэ дугаар зөв үү?</div>
+    <div id="found"><div class="code" id="fcode"></div><div class="q">Энэ дугаар зөв үү?</div><div class="note" id="fnote"></div>
       <div class="row"><button class="btn no" id="fno">✗ Үгүй</button><button class="btn ok" id="fok">✓ Зөв</button></div></div>
     <div id="list"></div>
     <button class="btn" id="done" disabled>Вэб рүү илгээх</button>
@@ -47,37 +48,131 @@
   </div>
   <div id="err"></div>
 </div>
-<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
+<script>
+/* PaddleOCR (PP-OCRv4) det+rec — браузер ба node-д ажиллана. img: {data:RGBA Uint8ClampedArray, width, height} */
+(function (G) {
+  function resizeRGBA(img, w, h) { // bilinear
+    var o = new Uint8ClampedArray(w * h * 4), sx = img.width / w, sy = img.height / h;
+    for (var y = 0; y < h; y++) { var fy = (y + 0.5) * sy - 0.5, y0 = Math.max(0, Math.floor(fy)), y1 = Math.min(img.height - 1, y0 + 1), dy = fy - y0;
+      for (var x = 0; x < w; x++) { var fx = (x + 0.5) * sx - 0.5, x0 = Math.max(0, Math.floor(fx)), x1 = Math.min(img.width - 1, x0 + 1), dx = fx - x0;
+        for (var c = 0; c < 3; c++) { var a = img.data[(y0 * img.width + x0) * 4 + c], b = img.data[(y0 * img.width + x1) * 4 + c], d = img.data[(y1 * img.width + x0) * 4 + c], e = img.data[(y1 * img.width + x1) * 4 + c];
+          o[(y * w + x) * 4 + c] = (a * (1 - dx) + b * dx) * (1 - dy) + (d * (1 - dx) + e * dx) * dy; } o[(y * w + x) * 4 + 3] = 255; } }
+    return { data: o, width: w, height: h };
+  }
+  function cropRGBA(img, x, y, w, h) {
+    x = Math.max(0, Math.round(x)); y = Math.max(0, Math.round(y)); w = Math.min(img.width - x, Math.round(w)); h = Math.min(img.height - y, Math.round(h));
+    var o = new Uint8ClampedArray(w * h * 4);
+    for (var r = 0; r < h; r++) o.set(img.data.subarray(((y + r) * img.width + x) * 4, ((y + r) * img.width + x + w) * 4), r * w * 4);
+    return { data: o, width: w, height: h };
+  }
+  function toTensor(img, mean, std) {
+    var n = img.width * img.height, f = new Float32Array(3 * n);
+    for (var i = 0; i < n; i++) for (var c = 0; c < 3; c++) f[c * n + i] = (img.data[i * 4 + c] / 255 - mean[c]) / std[c];
+    return f;
+  }
+  function make(ort, detModel, recModel, keysText) {
+    var keys = ['blank'].concat(keysText.split('\n').filter(function (x) { return x !== ''; })).concat([' ']);
+    var det, rec;
+    var ready = Promise.all([ort.InferenceSession.create(detModel), ort.InferenceSession.create(recModel)]).then(function (s) { det = s[0]; rec = s[1]; });
+    function runDet(img, lim) {
+      lim = lim || 960; var k = lim / Math.max(img.width, img.height);
+      var w = Math.max(32, Math.round(img.width * k / 32) * 32), h = Math.max(32, Math.round(img.height * k / 32) * 32), r = resizeRGBA(img, w, h);
+      var t = new ort.Tensor('float32', toTensor(r, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]), [1, 3, h, w]), feeds = {}; feeds[det.inputNames[0]] = t;
+      return det.run(feeds).then(function (o) {
+        var p = o[det.outputNames[0]].data, seen = new Uint8Array(w * h), boxes = [], sx = img.width / w, sy = img.height / h;
+        for (var i = 0; i < w * h; i++) {
+          if (seen[i] || p[i] < 0.3) continue;
+          var st = [i], x0 = w, y0 = h, x1 = 0, y1 = 0, n = 0, sum = 0; seen[i] = 1;
+          while (st.length) { var j = st.pop(), x = j % w, y = (j / w) | 0; n++; sum += p[j]; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+            [j - 1, j + 1, j - w, j + w].forEach(function (q) { if (q >= 0 && q < w * h && !seen[q] && p[q] >= 0.3 && Math.abs((q % w) - x) <= 1) { seen[q] = 1; st.push(q); } }); }
+          if (n < 12 || sum / n < 0.5) continue;
+          var bw = x1 - x0 + 1, bh = y1 - y0 + 1, pad = Math.max(bh * 0.6, 3); // unclip
+          boxes.push({ x: (x0 - pad) * sx, y: (y0 - pad) * sy, w: (bw + 2 * pad) * sx, h: (bh + 2 * pad) * sy });
+        }
+        return boxes;
+      });
+    }
+    function runRec(img) {
+      var h = 48, w = Math.min(1280, Math.max(16, Math.round(img.width * h / img.height))), r = resizeRGBA(img, w, h);
+      var feeds = {}; feeds[rec.inputNames[0]] = new ort.Tensor('float32', toTensor(r, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]), [1, 3, h, w]);
+      return rec.run(feeds).then(function (o) {
+        var out = o[rec.outputNames[0]], T = out.dims[1], C = out.dims[2], prev = -1, txt = '', conf = 0, cnt = 0;
+        for (var t = 0; t < T; t++) { var m = -1, mi = 0; for (var c = 0; c < C; c++) { var v = out.data[t * C + c]; if (v > m) { m = v; mi = c; } }
+          if (mi !== prev && mi !== 0) { txt += keys[mi] || ''; conf += m; cnt++; } prev = mi; }
+        return { text: txt, conf: cnt ? conf / cnt : 0 };
+      });
+    }
+    /** зураг → текстийн мөрүүд [{text, conf, box}] */
+    function read(img) {
+      return ready.then(function () { return runDet(img); }).then(function (boxes) {
+        boxes = boxes.filter(function (b) { return b.w > 8 && b.h > 6; }).sort(function (a, b) { return Math.abs(a.y - b.y) > Math.min(a.h, b.h) / 2 ? a.y - b.y : a.x - b.x; }).slice(0, 12);
+        var res = [];
+        return boxes.reduce(function (pr, b) { return pr.then(function () { var c = cropRGBA(img, b.x, b.y, b.w, b.h); if (!c.width || !c.height) return; return runRec(c).then(function (r) { r.box = b; res.push(r); }); }); }, Promise.resolve()).then(function () { return res; });
+      });
+    }
+    return { ready: ready, read: read, readLine: function (img) { return ready.then(function () { return runRec(img); }); } };
+  }
+  /* ISO 6346 */
+  function isoOk(c) { if (!/^[A-Z]{4}\d{7}$/.test(c)) return false; var v = function (ch) { var n = ch.charCodeAt(0) - 55; return n + Math.floor((n - 1) / 10); }, s = 0; for (var i = 0; i < 10; i++) s += (i < 4 ? v(c[i]) : +c[i]) * Math.pow(2, i); return (s % 11) % 10 === +c[10]; }
+  function chk(c) { var v = function (ch) { var n = ch.charCodeAt(0) - 55; return n + Math.floor((n - 1) / 10); }, s = 0; for (var i = 0; i < 10; i++) s += (i < 4 ? v(c[i]) : +c[i]) * Math.pow(2, i); return (s % 11) % 10; }
+  var toD = { O: '0', Q: '0', D: '0', I: '1', L: '1', T: '1', Z: '2', S: '5', B: '8', G: '6' }, toL = { '0': 'O', '1': 'I', '2': 'Z', '5': 'S', '8': 'B', '6': 'G' };
+  /** мөрүүдээс ISO-оор зөв чингэлгийн дугаарууд. {codes:[...], serials:[...]} — serials: үсэг нь уншигдаагүй 7 оронтой хэсэг (жагсаалтаас тааруулна) */
+  function codesFrom(lines) {
+    var toks = [], out = [], guess = [], ser = [];
+    lines.forEach(function (l) { String(l.text || l).toUpperCase().split(/[^A-Z0-9]+/).forEach(function (t) { if (t) toks.push(t); }); });
+    var fx = function (str, map) { return str.split('').map(function (c) { return map[c] || c; }).join(''); };
+    for (var i = 0; i < toks.length; i++) for (var j = i; j < Math.min(toks.length, i + 4); j++) {
+      var s = toks.slice(i, j + 1).join('');
+      for (var p = 0; p + 10 <= s.length; p++) {
+        var a = fx(s.substr(p, 4), toL), d = fx(s.substr(p + 4, 7), toD);
+        if (!/^[A-Z]{3}[UJZ]$/.test(a)) continue;
+        if (/^\d{7}$/.test(d)) { if (isoOk(a + d)) { if (out.indexOf(a + d) < 0) out.push(a + d); continue; } }
+        var d6 = d.substr(0, 6);
+        if (/^\d{6}$/.test(d6) && (d.length === 6) && p === 0 && s.length === 10) { var cc = a + d6 + chk(a + d6); if (guess.indexOf(cc) < 0) guess.push(cc); }
+      }
+    }
+    // зөвхөн цифр: 6 оронтой серийн дугаар (+ шалгах цифр) — үсгийг жагсаалтаас олно
+    for (i = 0; i < toks.length; i++) {
+      var t = fx(toks[i], toD), nx = toks[i + 1] ? fx(toks[i + 1], toD) : '';
+      if (/^\d{7}$/.test(t)) ser.push(t); else if (/^\d{6}$/.test(t)) ser.push(/^\d$/.test(nx) ? t + nx : t);
+    }
+    return { codes: out.length ? out : guess, serials: ser };
+  }
+  var api = { make: make, isoOk: isoOk, codesFrom: codesFrom, cropRGBA: cropRGBA };
+  if (typeof module !== 'undefined') module.exports = api; else G.TTOCR = api;
+})(this);
+
+</script>
 <script>
 (function () {
   var $ = function (id) { return document.getElementById(id); };
   var qs = new URLSearchParams(location.search), MAX = Math.max(1, Math.min(4, +(qs.get('n') || 4)));
   var LOCAL = qs.get('local') === '1';
   var v = $('v'), ov = $('ov'), ctx = ov.getContext('2d'), work = document.createElement('canvas');
-  var picked = [], rejected = {}, pending = null, busy = false, worker = null, stream = null;
-
-  /* ISO 6346 шалгах орон */
-  function isoOk(c) {
-    if (!/^[A-Z]{4}\d{7}$/.test(c)) return false;
-    var val = function (ch) { var n = ch.charCodeAt(0) - 55; return n + Math.floor((n - 1) / 10); }, s = 0;
-    for (var i = 0; i < 10; i++) s += (i < 4 ? val(c[i]) : +c[i]) * Math.pow(2, i);
-    return (s % 11) % 10 === +c[10];
-  }
-  var toD = { O: '0', Q: '0', D: '0', I: '1', L: '1', T: '1', Z: '2', S: '5', B: '8', G: '6' };
-  var toL = { '0': 'O', '1': 'I', '2': 'Z', '5': 'S', '8': 'B', '6': 'G' };
-  /** OCR текстээс ISO-оор зөв чингэлгийн дугаарууд */
-  function findCodes(text) {
-    var T = String(text).toUpperCase(), out = [];
-    var lines = T.split(/\n/).map(function (l) { return l.replace(/[^A-Z0-9]/g, ''); });
-    lines.push(T.replace(/[^A-Z0-9]/g, ''));
-    lines.forEach(function (l) {
-      for (var i = 0; i + 11 <= l.length; i++) {
-        var s = l.substr(i, 11), a = s.slice(0, 4).split('').map(function (c) { return toL[c] || c; }).join(''), d = s.slice(4).split('').map(function (c) { return toD[c] || c; }).join('');
-        if (!/^[A-Z]{3}[UJZ]$/.test(a) || !/^\d{7}$/.test(d)) continue;
-        var c = a + d; if (isoOk(c) && out.indexOf(c) < 0) out.push(c);
+  var picked = [], rejected = {}, pending = null, busy = false, ocr = null, stream = null;
+  var isoOk = TTOCR.isoOk;
+  /* вэбээс ирэх чингэлгийн жагсаалт (талбайд байгаа нь эхэнд) */
+  var KNOWN = []; try { KNOWN = JSON.parse(localStorage.getItem('tt_known') || '[]'); } catch (e) { }
+  window.addEventListener('message', function (e) { var d = e.data; if (d && d.type === 'tt-known' && Array.isArray(d.list)) { KNOWN = d.list; try { localStorage.setItem('tt_known', JSON.stringify(KNOWN.slice(0, 5000))); } catch (x) { } } });
+  try { if (window.opener) window.opener.postMessage({ type: 'tt-ready' }, '*'); } catch (e) { }
+  /** уншсан мөрүүдээс санал болгох дугаар: {code, note} */
+  function decide(lines) {
+    var r = TTOCR.codesFrom(lines), ok = function (c) { return picked.indexOf(c) < 0 && !rejected[c]; };
+    var codes = r.codes.filter(ok);
+    if (codes.length) {
+      var c = codes[0], inList = KNOWN.indexOf(c) >= 0;
+      if (!inList && KNOWN.length) { // үсэг/цифр буруу уншсан бол жагсаалтаас ижил серийн дугаартайг сонгоно
+        var alt = KNOWN.filter(function (k) { return k.substr(4, 6) === c.substr(4, 6) && ok(k); });
+        if (alt.length === 1) return { code: alt[0], note: 'Жагсаалтаас тааруулав' };
       }
-    });
-    return out;
+      return { code: c, note: inList || !KNOWN.length ? '' : '⚠ Манай жагсаалтад байхгүй дугаар' };
+    }
+    for (var i = 0; i < r.serials.length; i++) { // зөвхөн цифр уншигдсан
+      var sr = r.serials[i], m = KNOWN.filter(function (k) { return (sr.length === 7 ? k.substr(4) === sr : k.substr(4, 6) === sr) && ok(k); });
+      if (m.length === 1) return { code: m[0], note: 'Үсэг нь бүдэг — жагсаалтаас олов' };
+    }
+    return null;
   }
   function guide() { var W = ov.width, H = ov.height, gw = Math.round(W * 0.86), gh = Math.round(Math.min(H * 0.2, gw * 0.3)); return { x: (W - gw) / 2, y: H * 0.34 - gh / 2, w: gw, h: gh }; }
   function draw(color, label) {
@@ -88,28 +183,28 @@
     $('msg').style.top = (g.y + g.h) / devicePixelRatio + 12 + 'px'; $('msg').textContent = label;
   }
   function crop() {
-    // видеоны харагдаж буй хэсгээс хүрээний доторхыг тайрна
+    // видеоны харагдаж буй хэсгээс хүрээний доторхыг (бага зэрэг өргөнөөр) тайрна
     var vw = v.videoWidth, vh = v.videoHeight, cw = ov.clientWidth, ch = ov.clientHeight;
     var sc = Math.max(cw / vw, ch / vh), ox = (cw - vw * sc) / 2, oy = (ch - vh * sc) / 2, g = guide(), d = devicePixelRatio;
-    var sx = (g.x / d - ox) / sc, sy = (g.y / d - oy) / sc, sw = g.w / d / sc, sh = g.h / d / sc;
-    var k = Math.min(2.5, 1400 / sw); work.width = Math.round(sw * k); work.height = Math.round(sh * k);
-    var c = work.getContext('2d'); c.filter = 'grayscale(1) contrast(1.6)'; c.drawImage(v, sx, sy, sw, sh, 0, 0, work.width, work.height);
-    return work;
+    var sx = (g.x / d - ox) / sc, sy = (g.y / d - oy) / sc, sw = g.w / d / sc, sh = g.h / d / sc, m = sh * 0.25;
+    sy = Math.max(0, sy - m); sh = Math.min(vh - sy, sh + 2 * m);
+    var k = Math.min(2, 1280 / sw); work.width = Math.round(sw * k); work.height = Math.round(sh * k);
+    var c = work.getContext('2d', { willReadFrequently: true }); c.drawImage(v, sx, sy, sw, sh, 0, 0, work.width, work.height);
+    return c.getImageData(0, 0, work.width, work.height);
   }
   function loop() {
-    if (!busy && !pending && worker && v.readyState >= 2 && picked.length < MAX) {
+    if (!busy && !pending && ocr && v.readyState >= 2 && picked.length < MAX) {
       busy = true;
-      worker.recognize(crop()).then(function (r) {
-        busy = false;
-        var codes = findCodes(r.data.text).filter(function (c) { return picked.indexOf(c) < 0 && !rejected[c]; });
-        if (codes.length) { pending = codes[0]; showFound(); }
-      }).catch(function () { busy = false; });
+      ocr.read(crop()).then(function (lines) {
+        busy = false; var f = decide(lines);
+        if (f) { pending = f.code; showFound(f.note); }
+      }).catch(function (e) { busy = false; console.error(e); });
     }
-    if (!pending) draw(picked.length >= MAX ? '#94A3B8' : '#ffffffcc', picked.length >= MAX ? MAX + ' чингэлэг уншигдлаа — «Вэб рүү илгээх» дарна уу' : 'Чингэлгийн дугаарыг цагаан хүрээнд багтаана уу');
-    setTimeout(loop, 350);
+    if (!pending && ocr) draw(picked.length >= MAX ? '#94A3B8' : '#ffffffcc', picked.length >= MAX ? MAX + ' чингэлэг уншигдлаа — «Вэб рүү илгээх» дарна уу' : 'Чингэлгийн дугаарыг цагаан хүрээнд багтаана уу');
+    setTimeout(loop, 150);
   }
-  function showFound() {
-    draw('#16A34A', '✓ Дугаар олдлоо');
+  function showFound(note) {
+    draw('#16A34A', '✓ Дугаар олдлоо'); $('fnote').textContent = note || '';
     if (navigator.vibrate) navigator.vibrate(80);
     $('fcode').innerHTML = pending.slice(0, 4) + '<span>' + pending.slice(4) + '</span>'; $('found').style.display = 'block';
   }
@@ -119,7 +214,7 @@
     $('list').querySelectorAll('button').forEach(function (b) { b.onclick = function () { picked.splice(+b.dataset.i, 1); render(); }; });
     $('done').disabled = !picked.length; $('done').textContent = picked.length ? 'Вэб рүү илгээх (' + picked.length + ')' : 'Вэб рүү илгээх';
   }
-  $('fok').onclick = function () { picked.push(pending); pending = null; $('found').style.display = 'none'; render(); };
+  $('fok').onclick = function () { picked.push(pending); KNOWN.indexOf(pending) < 0 && KNOWN.push(pending); pending = null; $('found').style.display = 'none'; render(); };
   $('fno').onclick = function () { rejected[pending] = 1; setTimeout(function (c) { delete rejected[c]; }, 4000, pending); pending = null; $('found').style.display = 'none'; };
   $('manual').onclick = function () {
     var c = (prompt('Чингэлгийн дугаар (жиш. CICU3534290)') || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
@@ -145,12 +240,14 @@
     var tr = s.getVideoTracks()[0], caps = tr.getCapabilities ? tr.getCapabilities() : {};
     if (caps.torch) { $('torch').hidden = false; var on = false; $('torch').onclick = function () { on = !on; tr.applyConstraints({ advanced: [{ torch: on }] }); }; }
     if (caps.focusMode && caps.focusMode.indexOf('continuous') >= 0) tr.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }).catch(function () { });
-    draw('#ffffffcc', 'Унших програм ачаалж байна… (анх удаа 5–10 сек)');
-    var opt = LOCAL ? { workerPath: './node_modules/tesseract.js/dist/worker.min.js', corePath: './node_modules/tesseract.js-core', langPath: './node_modules/@tesseract.js-data/eng/4.0.0_best_int' } : {};
-    return Tesseract.createWorker('eng', 1, opt).then(function (w) {
-      worker = w;
-      return w.setParameters({ tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', tessedit_pageseg_mode: '6' });
-    }).then(function () { render(); loop(); });
+    draw('#ffffffcc', 'Унших програм ачаалж байна… (анх удаа 15–30 сек, дараа нь шууд)');
+    var CDN = 'https://cdn.jsdelivr.net/npm/@gutenye/ocr-models@1.4.2/assets/', M = LOCAL ? './m/' : CDN;
+    ort.env.wasm.numThreads = 1; ort.env.wasm.wasmPaths = LOCAL ? './ortw/' : 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
+    var get1 = function (u, t) { return fetch(u, { cache: 'force-cache' }).then(function (r) { if (!r.ok) throw new Error(u + ' ' + r.status); return t ? r.text() : r.arrayBuffer(); }).then(function (x) { return t ? x : new Uint8Array(x); }); };
+    var get = function (f, t) { return get1(M + f, t).catch(function () { return get1('./' + f, t); }); }; // CDN ажиллахгүй бол GitHub дээрх хуулбар
+    return Promise.all([get('ch_PP-OCRv4_det_infer.onnx'), get('ch_PP-OCRv4_rec_infer.onnx'), get('ppocr_keys_v1.txt', 1)]).then(function (a) {
+      var o = TTOCR.make(ort, a[0], a[1], a[2]); return o.ready.then(function () { ocr = o; render(); loop(); });
+    });
   }).catch(function (e) { fail(e && e.message || String(e)); });
   render();
 })();
